@@ -1,111 +1,120 @@
-# general mixed model code for variance component analysis
-# should link R to multithreaded blas library (like openblas or MKL) for best peformance
+# Tutorial / general purpose mixed model solver 
+# y named(!) phenotype vector (n)
+# B named list of covariance structures (m x m matrices)
+# X a incidence matrix for fixed effects (n x p fixed effects)
+# Z a incidence matrix for random effects (n x m) 
+# Ze a incidence matrix for random effects for error term only
+# reps  (T or F, are there replicates??)
+# alg derivative based algorithm ('ai' = average information, 'fs' = fisher scoring (default, most numerically stable), or 'nr' = newton-rhapson (fastest to slowest), sqrt  )
+# conv.val value for convergence
+# Var vector of initialization values for variance components
+# positiveVCs (should estimates of VCs be constrained to be positive)
+# Returns a list:
+# ...$Var = VC estimates
+# ...$invI = fisher information matrix
+#  sqrt(diag(...$invI)) = SE of VC estimates
+# ...$W = Vinverse
+# ...$Bhat = fixed effects
+# ...$llik = REML log-likelihood
+calcMM = function(y, B=NULL,X=NULL, Z=NULL, Ze=NULL, reps=FALSE,
+                     alg='fs', conv.val=1e-6, Var=NULL,positiveVCs=FALSE){
+    strain.names=(names(y))
+    unique.sn=unique(strain.names)
+    n.to.m=match(strain.names, unique.sn)
 
-library(Matrix)
-library(regress)
+    strain.ind  = seq_along(strain.names)
+    strain.cnt  = length(unique.sn)
+    #for constructing Strain Variance component
+    Strain      = Matrix(diag(strain.cnt), sparse=T)
 
-basedir='/home/jbloom/Dropbox/code/variance_components/'
-source(paste0(basedir,'functions.R'))
+    # If B is NULL then add a covariance term that is the identity matix - will then calculate effect of strain (broad-sense heritability)
+    if(is.null(B)) { B=list(Strain=Strain);  } else{
+        if (reps) { B=c(B, list(Strain=Strain))  } }    
+    # If Z is null and there are no replicates this will make Z a diagonal incidence matrix, otherwise this constructs an incidence matrix based on strain names
+    if(is.null(Z)) {   Z=Matrix(0, length(y), strain.cnt,sparse=T);   Z[cbind(strain.ind, n.to.m)]=1 }
+    # If X is null assume one fixed effect of population mean
+    if(is.null(X) ) {  X=model.matrix(y~1)}
+    # If Ze is null assume no error structure
+    if(is.null(Ze)) {  Ze=Matrix((diag(length(y))),sparse=T) }
 
-# pull 1000 BYxRM genotype data---------------------------------------------------------------------------------------
-load(url("http://genomics-pubs.princeton.edu/YeastCross_BYxRM/data/cross.Rdata"))
-#extracts and recodes genotype as -1 (BY) and +1 RM ... input genotypes could also be coded as 0,1,2 for F2 cross
-extractGenotype=function(impcross){ (do.call('cbind', sapply(impcross$geno, function(x) { x$data }))*2)-3 }
-
-#extract genotype data  where G is (n x M) matrix (n = individuals, M = markers)
-#!!!could use your own genotypes here
-G  =  extractGenotype(cross)
-
-# scale genotypes
-G.s = scale(G)
-#calculate strain relatedness as (G %*% t(G))/n 
-A = tcrossprod(G.s)/ncol(G)
-
-#for example simulate h2 = 60% and 20 markers with effects, constant effect size with random sign, could be whatever
-
-#!!!could use your own phenotypes here
-set.seed(5)
-simY=simPhenotypes(G, h2=.6, nadditive=20, nsims=50) 
-
-
-example_trait=simY[,7]
-# 1) --- using random regression---------------------
-    #take one of the simulations, for example the 7th one
-    r=regress(example_trait~1, ~A)
-
-    #additive variance
-    r$sigma[1]
-    # 0.5611
-    #standard error
-    sqrt(diag(r$sigma.cov)[1])
-    #0.07371 
-
-
-# 2) --- using tutorial code --------------------------
-    #note vector needs to be named for this function
-    r=calcMM(y=example_trait, B=list(A=A))
-    #additive variance
-    r$Var[1]
-    #0.5611
-    sqrt(diag(r$invI))[1]
-    #0.07371
-#----------------------------------------------------
-
-
-# 3) using Eskin 2008 trick if genotype matrix is the same for different phenotypes ---
-    eigA= doEigenA_forMM(A)
-
-    #initialize matrix for output
-    vA=matrix(0,ncol(simY),2)
-    colnames(vA)=c('additive_var', 'error_var')
-
-    #per phenotype
-    for(i in 1:ncol(simY)){
-        vA[i,]=m.S(simY[,i],theta=eigA$theta, Q=eigA$Q)
-    }
-
-    print(vA[7,1])
-    #additive_var 
-    #  0.5611 
-# ------------------------------------------------------
-
-
-
-
-# example F2 genotypes and phenotypes
-# transpose to make it individuals (rows) X markers (cols)
-G=t(read.delim(paste0(basedir, 'genos.txt'), header=F))
-simY=read.delim(paste0(basedir, 'phenos.txt'), header=F)
-G.s=scale(G)
-A=tcrossprod(G.s)/ncol(G)
-#1)
-r=regress(simY[,1]~1, ~A)
-
-    #additive variance
-    r$sigma[1]
-    #18.48 
-
-    #standard error
-    sqrt(diag(r$sigma.cov)[1])
-    #1.093e-18 
+    #number of terms in the structured covariance
+    VC.names=paste('sigma', c(names(B), 'E'), sep='')
+    N.s.c=length(B)
+    Vcmp.cnt=N.s.c+1
+    # starting values for VC estimates as 1 / (#of VCs including residual error term)
+    if(is.null(Var) ) { Var=rep(1/Vcmp.cnt, Vcmp.cnt) }
+    I = matrix(0, ncol= Vcmp.cnt, nrow= Vcmp.cnt)
+	s = matrix(0, ncol=1, nrow= Vcmp.cnt)
     
-namedY=simY[,1]
-names(namedY)=seq_along(namedY)
-
-#2)
-#nr usually a bit more stable , but all of these algorithms fail with low N
-r=calcMM(y=namedY, B=list(A=A), alg='nr')
-
-#3)
-    eigA= doEigenA_forMM(A)
-
-    #initialize matrix for output
-    vA=matrix(0,ncol(simY),2)
-    colnames(vA)=c('additive_var', 'error_var')
-
-    #per phenotype
-    for(i in 1:ncol(simY)){
-        vA[i,]=m.S(simY[,i],theta=eigA$theta, Q=eigA$Q)
+    diffs=rep(10,  Vcmp.cnt)
+    
+    # second derivatives of V with respect to the variance components (Lynch and Walsh 27.15)
+    VV = list()
+    for(i in 1:N.s.c) {
+              VV[[i]]=Z %*% tcrossprod(B[[i]],Z)  
     }
-    print(vA[1,1])
+    VV[[ Vcmp.cnt ]]=Ze 
 
+    i = 0
+    # while the differences haven't converged 
+    while ( sum(ifelse(diffs<conv.val, TRUE,FALSE)) <  Vcmp.cnt ) { 
+		i = i + 1
+        V=matrix(0,length(y), length(y))
+	    for( vcs in 1:length(VV)) {  V=V+(VV[[vcs]]*Var[vcs]) }
+        print('Inverting V')
+        Vinv = solve(V)
+        print('Done inverting V')
+        tXVinvX=t(X) %*% as.matrix(Vinv) %*% X
+        print('Done inverting t(X)%*%Vinv%*%X')
+        #sx=svd(tXVinvX)
+        #inv.tXVinvX=sx$v %*% diag(1/sx$d) %*% t(sx$u) #  Xinv = V 1/D U'
+        inv.tXVinvX = solve(tXVinvX)
+        #inv.tXVinvX =pinv(as.matrix(tXVinvX))
+        itv = inv.tXVinvX %*% t(X)%*%Vinv
+        P = Vinv - Vinv %*% X %*% itv 
+
+        #algorithm choices
+        if(alg=='fs') {print("Fisher scoring algorithm: calculating expected VC Hessian") }
+        if(alg=='nr') {print("Netwon rhapson algorithm: calculating observed VC Hessian") }
+        if(alg=='ai') {print("Average information algorithm: calculating avg of expected and observed VC Hessians") }
+        
+        for(ii in 1:Vcmp.cnt) {
+           for(jj in ii:Vcmp.cnt) {
+                 if (alg=='fs') {    I[ii,jj]= 0.5*sum(diag( ((P%*%VV[[ii]]) %*%P )%*%VV[[jj]])) }
+                 if (alg=='nr') {    I[ii,jj]=-0.5*sum(diag(P%*%VV[[ii]]%*%P%*%VV[[jj]])) + (t(y)%*%P%*%VV[[ii]]%*%P%*%VV[[jj]]%*%P%*%y)[1,1] }
+                 if (alg=='ai') {    I[ii,jj]= 0.5*( t(y)%*%P%*%VV[[ii]]%*%P%*%VV[[jj]]%*%P%*%y)[1,1]  } 
+                 print(paste(ii, jj))
+                 I[jj,ii]=I[ii,jj]
+           }
+           s[ii,1]= -0.5*sum(diag(P%*%VV[[ii]])) + .5*(t(y)%*%P%*%VV[[ii]]%*%P%*%y )[1,1] 
+        }
+        invI = solve(I)
+        print(invI)
+        print(s) 
+        newVar = Var + invI%*%s
+        # uncomment the line below if you wanted to constrain VC estimates to be positive
+        if(positiveVCs) {     newVar[newVar<0]=2.6e-9 }
+
+        for(d in 1:length(diffs)) { diffs[d]=abs(Var[d] - newVar[d]) }
+		Var = newVar
+        
+        cat('\n')
+        cat("iteration ", i, '\n')
+        cat(VC.names, '\n')
+        cat(Var, '\n')
+        # hard stop on number of iterations 
+        if(i>100) { stop(" give up, never going to converge ... or try changing specifying starting values in Var" ) } 
+        Bhat= itv %*% y
+        cat("Fixed Effects, Bhat = ", as.matrix(Bhat), '\n')
+#        det.tXVinvX=determinant(tXVinvX, logarithm=TRUE)
+#        det.tXVinvX=det.tXVinvX$modulus*det.tXVinvX$sign
+#        det.V =determinant(V, logarithm=TRUE)
+#        det.V=det.V$modulus*det.V$sign
+#        LL = -.5 * (det.tXVinvX + det.V + log(t(y) %*% P %*% y) )
+#        cat("Log Likelihood = " , as.matrix(LL), '\n')
+        cat("VC convergence vals", '\n')
+        cat(diffs, '\n')
+	}
+    	cat('\n')
+	return(list(Var=Var, invI=invI, W=Vinv, Bhat=Bhat)) #, llik=LL))
+} 
